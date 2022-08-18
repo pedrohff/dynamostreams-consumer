@@ -1,4 +1,4 @@
-package main
+package dynamostreamsconsumer
 
 import (
 	"context"
@@ -17,9 +17,15 @@ type DynamoStreamReader struct {
 	streamArn  string
 }
 
+type MessageProcessor func(map[string]interface{}) error
+
 // NewDynamoStreamReader
 func NewDynamoStreamReader(streamArn string, shardPointerWriter ShardPointerStorage) DynamoStreamReader {
 	return DynamoStreamReader{}
+}
+
+type AWSDynamoStream interface {
+	GetRecords(ctx context.Context, params *dynamodbstreams.GetRecordsInput, optFns ...func(*dynamodbstreams.Options)) (*dynamodbstreams.GetRecordsOutput, error)
 }
 
 // Connect

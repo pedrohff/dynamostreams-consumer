@@ -1,4 +1,4 @@
-package main
+package dynamostreamsconsumer
 
 import (
 	"encoding/json"
