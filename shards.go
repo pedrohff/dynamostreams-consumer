@@ -1,12 +1,18 @@
 package dynamostreamsconsumer
 
+import (
+	"context"
+	"time"
+)
+
 type ShardPointer struct {
-	ShardId            string `json:"shard_id"`
-	LastSequenceNumber string `json:"last_sequence_number"`
-	Finished           bool   `json:"finished"`
+	ShardId            string    `json:"shardId" bson:"_id"`
+	LastSequenceNumber string    `json:"lastSequenceNumber"`
+	Finished           bool      `json:"finished"`
+	UpdatedAt          time.Time `json:"updatedAt"`
 }
 
 type ShardPointerStorage interface {
-	SetShardPointer(pointer ShardPointer) error
-	GetShardPointer(string) (ShardPointer, error)
+	SetShardPointer(ctx context.Context, pointer ShardPointer) error
+	GetShardPointer(ctx context.Context, shardId string) (ShardPointer, error)
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	types2 "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
+	"time"
 )
 
 // DynamoStreamReader
@@ -17,11 +18,11 @@ type DynamoStreamReader struct {
 	streamArn  string
 }
 
-type MessageProcessor func(map[string]interface{}) error
+type MessageProcessor func(ctx context.Context, messageRead map[string]interface{}) error
 
 // NewDynamoStreamReader
-func NewDynamoStreamReader(streamArn string, shardPointerWriter ShardPointerStorage) DynamoStreamReader {
-	return DynamoStreamReader{}
+func NewDynamoStreamReader(streamArn string, shardPointerWriter ShardPointerStorage) *DynamoStreamReader {
+	return &DynamoStreamReader{streamArn: streamArn, storage: shardPointerWriter}
 }
 
 type AWSDynamoStream interface {
@@ -29,7 +30,7 @@ type AWSDynamoStream interface {
 }
 
 // Connect
-func (r DynamoStreamReader) Connect(ctx context.Context, awsAuthConfig aws.Config) error {
+func (r *DynamoStreamReader) Connect(ctx context.Context, awsAuthConfig aws.Config) error {
 	var err error
 	r.ddbsClient = dynamodbstreams.NewFromConfig(awsAuthConfig)
 	r.stream, err = r.ddbsClient.DescribeStream(ctx, &dynamodbstreams.DescribeStreamInput{StreamArn: &r.streamArn})
@@ -40,7 +41,7 @@ func (r DynamoStreamReader) Connect(ctx context.Context, awsAuthConfig aws.Confi
 }
 
 // Read
-func (r DynamoStreamReader) Read(ctx context.Context, processor MessageProcessor) error {
+func (r *DynamoStreamReader) Read(ctx context.Context, processor MessageProcessor) error {
 	if r.ddbsClient == nil {
 		return fmt.Errorf("dynamo is not connected, use the Connect method prior to reading")
 	}
@@ -56,7 +57,7 @@ func (r DynamoStreamReader) Read(ctx context.Context, processor MessageProcessor
 
 // getShardIteratorAndReadShard
 func (r DynamoStreamReader) getShardIteratorAndReadShard(ctx context.Context, processor MessageProcessor, shard types2.Shard) error {
-	pointer, err := r.storage.GetShardPointer(*shard.ShardId)
+	pointer, err := r.storage.GetShardPointer(context.Background(), *shard.ShardId)
 	if err != nil {
 		return err
 	}
@@ -67,9 +68,12 @@ func (r DynamoStreamReader) getShardIteratorAndReadShard(ctx context.Context, pr
 
 	_, shardPointerResult, readShardErr := r.readShard(ctx, *shard.ShardId, pointer.LastSequenceNumber, *iterator.ShardIterator, processor)
 	if readShardErr != nil {
+		shardPointerResult.UpdatedAt = time.Now()
+		_ = r.storage.SetShardPointer(context.Background(), shardPointerResult)
 		return readShardErr
 	}
-	setShardPointerErr := r.storage.SetShardPointer(shardPointerResult)
+	shardPointerResult.UpdatedAt = time.Now()
+	setShardPointerErr := r.storage.SetShardPointer(ctx, shardPointerResult)
 	if setShardPointerErr != nil {
 		return setShardPointerErr
 	}
@@ -77,25 +81,24 @@ func (r DynamoStreamReader) getShardIteratorAndReadShard(ctx context.Context, pr
 }
 
 // getShardIterator
-func (r DynamoStreamReader) getShardIterator(ctx context.Context, shardId, lastSequenceNumber string) (*dynamodbstreams.GetShardIteratorOutput, error) {
+func (r *DynamoStreamReader) getShardIterator(ctx context.Context, shardId, lastSequenceNumber string) (*dynamodbstreams.GetShardIteratorOutput, error) {
 	shardIteratorInput := &dynamodbstreams.GetShardIteratorInput{
 		ShardId:           &shardId,
 		ShardIteratorType: types2.ShardIteratorTypeTrimHorizon,
 		StreamArn:         &r.streamArn,
-		SequenceNumber:    &lastSequenceNumber,
 	}
 
 	// if we have the sequence number, we should swap to ShardIteratorTypeAfterSequenceNumber
 	if lastSequenceNumber != "" {
 		shardIteratorInput.ShardIteratorType = types2.ShardIteratorTypeAfterSequenceNumber
+		shardIteratorInput.SequenceNumber = &lastSequenceNumber
 	}
 
 	return r.ddbsClient.GetShardIterator(ctx, shardIteratorInput)
 }
 
 // readShard
-func (r DynamoStreamReader) readShard(ctx context.Context, shardId, lastSequenceNumber, shardIteratorId string, processor MessageProcessor) (int, ShardPointer, error) {
-
+func (r *DynamoStreamReader) readShard(ctx context.Context, shardId, lastSequenceNumber, shardIteratorId string, processor MessageProcessor) (int, ShardPointer, error) {
 	counter := 0
 	iterationCounter := 0
 	for {
@@ -122,16 +125,14 @@ func (r DynamoStreamReader) readShard(ctx context.Context, shardId, lastSequence
 					if parseErr != nil {
 						return counter, ShardPointer{ShardId: shardId, LastSequenceNumber: lastSequenceNumber}, parseErr
 					}
-					err := processor(resultMap)
+					err := processor(ctx, resultMap)
 					if err != nil {
 						return 0, ShardPointer{}, err
 					}
 				}
 			}
 
-			fmt.Printf("shard %s read %d records in [%d] iterations\n", shardId, counter, iterationCounter)
 			if r.shardIsFinished(records, shardIteratorId) {
-				fmt.Println("finished shard", shardId)
 				return counter, ShardPointer{ShardId: shardId, LastSequenceNumber: lastSequenceNumber, Finished: true}, nil
 			}
 			shardIteratorId = *records.NextShardIterator
@@ -145,11 +146,11 @@ func (r DynamoStreamReader) readShard(ctx context.Context, shardId, lastSequence
 //    The next position in the shard from which to start sequentially reading stream records.
 //    If set to null, the shard has been closed and the requested iterator will not return any more data.
 // https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_GetRecords.html#API_streams_GetRecords_RequestSyntax
-func (r DynamoStreamReader) shardIsFinished(records *dynamodbstreams.GetRecordsOutput, shardIteratorId string) bool {
+func (r *DynamoStreamReader) shardIsFinished(records *dynamodbstreams.GetRecordsOutput, shardIteratorId string) bool {
 	return records.NextShardIterator == nil || shardIteratorId == *records.NextShardIterator
 }
 
-func (r DynamoStreamReader) parseDynamoStreamRecordToMap(d types2.Record) (map[string]interface{}, error) {
+func (r *DynamoStreamReader) parseDynamoStreamRecordToMap(d types2.Record) (map[string]interface{}, error) {
 	temp := map[string]interface{}{}
 	streamsMap, err := attributevalue.FromDynamoDBStreamsMap(d.Dynamodb.NewImage)
 	if err != nil {
