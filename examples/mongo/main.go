@@ -24,7 +24,6 @@ var (
 	mongoCollection = flag.String("mongoCollection", "store", "mongo's collection for storing shards")
 )
 
-//shardId-00000001661406692475-c727d37d
 func main() {
 	flag.Parse()
 	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
