@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	types2 "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
+	"golang.org/x/sync/errgroup"
 	"time"
 )
 
@@ -46,13 +47,14 @@ func (r *DynamoStreamReader) Read(ctx context.Context, processor MessageProcesso
 		return fmt.Errorf("dynamo is not connected, use the Connect method prior to reading")
 	}
 
+	eg := errgroup.Group{}
 	for _, shard := range r.stream.StreamDescription.Shards {
-		err := r.getShardIteratorAndReadShard(ctx, processor, shard)
-		if err != nil {
-			return err
-		}
+		eg.Go(func() error {
+			return r.getShardIteratorAndReadShard(ctx, processor, shard)
+		})
 	}
-	return nil
+
+	return eg.Wait()
 }
 
 // getShardIteratorAndReadShard
@@ -60,6 +62,9 @@ func (r DynamoStreamReader) getShardIteratorAndReadShard(ctx context.Context, pr
 	pointer, err := r.storage.GetShardPointer(context.Background(), *shard.ShardId)
 	if err != nil {
 		return err
+	}
+	if pointer.Finished {
+		return nil
 	}
 	iterator, err := r.getShardIterator(ctx, *shard.ShardId, pointer.LastSequenceNumber)
 	if err != nil {
@@ -143,8 +148,10 @@ func (r *DynamoStreamReader) readShard(ctx context.Context, shardId, lastSequenc
 // shardIsFinished validates if the shard no longer will receive data following Dynamo's docs
 //
 // NextShardIterator:
-//    The next position in the shard from which to start sequentially reading stream records.
-//    If set to null, the shard has been closed and the requested iterator will not return any more data.
+//
+//	The next position in the shard from which to start sequentially reading stream records.
+//	If set to null, the shard has been closed and the requested iterator will not return any more data.
+//
 // https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_GetRecords.html#API_streams_GetRecords_RequestSyntax
 func (r *DynamoStreamReader) shardIsFinished(records *dynamodbstreams.GetRecordsOutput, shardIteratorId string) bool {
 	return records.NextShardIterator == nil || shardIteratorId == *records.NextShardIterator
