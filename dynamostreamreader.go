@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	types2 "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
-	"golang.org/x/sync/errgroup"
+	"sync"
 	"time"
 )
 
@@ -47,14 +47,32 @@ func (r *DynamoStreamReader) Read(ctx context.Context, processor MessageProcesso
 		return fmt.Errorf("dynamo is not connected, use the Connect method prior to reading")
 	}
 
-	eg := errgroup.Group{}
-	for _, shard := range r.stream.StreamDescription.Shards {
-		eg.Go(func() error {
-			return r.getShardIteratorAndReadShard(ctx, processor, shard)
-		})
-	}
+	errChan := make(chan error)
+	waitChan := make(chan struct{})
+	wg := sync.WaitGroup{}
 
-	return eg.Wait()
+	shards := r.stream.StreamDescription.Shards
+	wg.Add(len(shards))
+	go func() {
+		for _, shard := range shards {
+			go func(s types2.Shard) {
+				iterateErr := r.getShardIteratorAndReadShard(ctx, processor, s)
+				if iterateErr != nil {
+					errChan <- iterateErr
+				}
+				wg.Done()
+			}(shard)
+		}
+		wg.Wait()
+		close(waitChan)
+	}()
+
+	select {
+	case err := <-errChan:
+		return err
+	case <-waitChan:
+		return nil
+	}
 }
 
 // getShardIteratorAndReadShard
